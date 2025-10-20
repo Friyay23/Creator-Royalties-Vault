@@ -10,9 +10,13 @@
 (define-constant ERR-STREAM-NOT-FOUND (err u424))
 (define-constant ERR-STREAM-INACTIVE (err u426))
 (define-constant ERR-INSUFFICIENT-STREAM-BALANCE (err u427))
+(define-constant ERR-MILESTONE-NOT-FOUND (err u428))
+(define-constant ERR-MILESTONE-NOT-REACHED (err u429))
+(define-constant ERR-MILESTONE-ALREADY-CLAIMED (err u430))
 
 (define-data-var vault-counter uint u0)
 (define-data-var stream-counter uint u0)
+(define-data-var milestone-counter uint u0)
 
 (define-map vaults 
   { vault-id: uint }
@@ -320,8 +324,8 @@
 
 (define-read-only (calculate-available-stream (stream-id uint))
   (match (map-get? streaming-payments { stream-id: stream-id })
-    stream-data (
-      let (
+    stream-data
+      (let (
         (current-block stacks-block-height)
         (last-claimed (get last-claimed-block stream-data))
         (end-block (get end-block stream-data))
@@ -334,7 +338,6 @@
           u0
         )
       )
-    )
     u0
   )
 )
@@ -352,12 +355,14 @@
     
     (map-set streaming-payments
       { stream-id: stream-id }
-      (merge stream-data {
-        last-claimed-block: (if (<= stacks-block-height (get end-block stream-data))
-                             stacks-block-height
-                             (get end-block stream-data)),
-        total-streamed: (+ (get total-streamed stream-data) available-amount)
-      })
+      (merge stream-data 
+        {
+          last-claimed-block: (if (<= stacks-block-height (get end-block stream-data))
+                               stacks-block-height
+                               (get end-block stream-data)),
+          total-streamed: (+ (get total-streamed stream-data) available-amount)
+        }
+      )
     )
     
     (ok available-amount)
@@ -366,4 +371,105 @@
 
 (define-read-only (get-streaming-payment (stream-id uint))
   (map-get? streaming-payments { stream-id: stream-id })
+)
+
+(define-map milestones
+  { milestone-id: uint }
+  {
+    vault-id: uint,
+    title: (string-ascii 128),
+    target-value: uint,
+    current-value: uint,
+    reward-amount: uint,
+    is-claimed: bool,
+    created-at: uint
+  }
+)
+
+(define-public (create-milestone (vault-id uint) (title (string-ascii 128)) (target-value uint) (reward-amount uint))
+  (let (
+    (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+    (new-milestone-id (+ (var-get milestone-counter) u1))
+  )
+    (asserts! (is-eq tx-sender (get creator vault)) ERR-UNAUTHORIZED)
+    (asserts! (> target-value u0) ERR-INVALID-AMOUNT)
+    (asserts! (> reward-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (>= (get total-balance vault) reward-amount) ERR-INSUFFICIENT-BALANCE)
+    
+    (map-set milestones
+      { milestone-id: new-milestone-id }
+      {
+        vault-id: vault-id,
+        title: title,
+        target-value: target-value,
+        current-value: u0,
+        reward-amount: reward-amount,
+        is-claimed: false,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (map-set vaults
+      { vault-id: vault-id }
+      (merge vault { total-balance: (- (get total-balance vault) reward-amount) })
+    )
+    
+    (var-set milestone-counter new-milestone-id)
+    (ok new-milestone-id)
+  )
+)
+
+(define-public (update-milestone-progress (milestone-id uint) (new-value uint))
+  (let (
+    (milestone-data (unwrap! (map-get? milestones { milestone-id: milestone-id }) ERR-MILESTONE-NOT-FOUND))
+    (vault (unwrap! (map-get? vaults { vault-id: (get vault-id milestone-data) }) ERR-VAULT-NOT-FOUND))
+  )
+    (asserts! (is-eq tx-sender (get creator vault)) ERR-UNAUTHORIZED)
+    (asserts! (not (get is-claimed milestone-data)) ERR-MILESTONE-ALREADY-CLAIMED)
+    
+    (map-set milestones
+      { milestone-id: milestone-id }
+      (merge milestone-data { current-value: new-value })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (claim-milestone-reward (milestone-id uint))
+  (let (
+    (milestone-data (unwrap! (map-get? milestones { milestone-id: milestone-id }) ERR-MILESTONE-NOT-FOUND))
+    (vault (unwrap! (map-get? vaults { vault-id: (get vault-id milestone-data) }) ERR-VAULT-NOT-FOUND))
+    (reward (get reward-amount milestone-data))
+  )
+    (asserts! (is-eq tx-sender (get creator vault)) ERR-UNAUTHORIZED)
+    (asserts! (not (get is-claimed milestone-data)) ERR-MILESTONE-ALREADY-CLAIMED)
+    (asserts! (>= (get current-value milestone-data) (get target-value milestone-data)) ERR-MILESTONE-NOT-REACHED)
+    
+    (map-set milestones
+      { milestone-id: milestone-id }
+      (merge milestone-data { is-claimed: true })
+    )
+    
+    (map-set vaults
+      { vault-id: (get vault-id milestone-data) }
+      (merge vault { total-balance: (+ (get total-balance vault) reward) })
+    )
+    
+    (ok reward)
+  )
+)
+
+(define-read-only (get-milestone-info (milestone-id uint))
+  (map-get? milestones { milestone-id: milestone-id })
+)
+
+(define-read-only (check-milestone-reached (milestone-id uint))
+  (match (map-get? milestones { milestone-id: milestone-id })
+    milestone-data (some (>= (get current-value milestone-data) (get target-value milestone-data)))
+    none)
+)
+
+(define-read-only (get-milestone-counter)
+  (var-get milestone-counter)
 )
