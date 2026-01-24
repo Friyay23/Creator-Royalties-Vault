@@ -13,6 +13,9 @@
 (define-constant ERR-MILESTONE-NOT-FOUND (err u428))
 (define-constant ERR-MILESTONE-NOT-REACHED (err u429))
 (define-constant ERR-MILESTONE-ALREADY-CLAIMED (err u430))
+(define-constant ERR-REFERRAL-SELF (err u431))
+(define-constant ERR-ALREADY-REFERRED (err u432))
+(define-constant ERR-REFERRAL-DISABLED (err u433))
 
 (define-data-var vault-counter uint u0)
 (define-data-var stream-counter uint u0)
@@ -472,4 +475,151 @@
 
 (define-read-only (get-milestone-counter)
   (var-get milestone-counter)
+)
+
+(define-map referral-programs
+  { vault-id: uint }
+  {
+    reward-percentage: uint,
+    is-enabled: bool,
+    total-referrals: uint,
+    total-rewards-paid: uint
+  }
+)
+
+(define-map referrals
+  { vault-id: uint, referred-user: principal }
+  {
+    referrer: principal,
+    deposit-amount: uint,
+    reward-paid: uint,
+    referred-at: uint
+  }
+)
+
+(define-map referrer-stats
+  { vault-id: uint, referrer: principal }
+  {
+    total-referred: uint,
+    total-rewards: uint
+  }
+)
+
+(define-public (enable-referral-program (vault-id uint) (reward-percentage uint))
+  (let (
+    (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+  )
+    (asserts! (is-eq tx-sender (get creator vault)) ERR-UNAUTHORIZED)
+    (asserts! (is-valid-percentage reward-percentage) ERR-INVALID-PERCENTAGE)
+    
+    (map-set referral-programs
+      { vault-id: vault-id }
+      {
+        reward-percentage: reward-percentage,
+        is-enabled: true,
+        total-referrals: u0,
+        total-rewards-paid: u0
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (disable-referral-program (vault-id uint))
+  (let (
+    (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+    (program (unwrap! (map-get? referral-programs { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+  )
+    (asserts! (is-eq tx-sender (get creator vault)) ERR-UNAUTHORIZED)
+    
+    (map-set referral-programs
+      { vault-id: vault-id }
+      (merge program { is-enabled: false })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (deposit-with-referral (vault-id uint) (referrer principal) (amount uint))
+  (let (
+    (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+    (program (unwrap! (map-get? referral-programs { vault-id: vault-id }) ERR-REFERRAL-DISABLED))
+    (reward-amount (/ (* amount (get reward-percentage program)) u10000))
+    (existing-referrer-stats (default-to { total-referred: u0, total-rewards: u0 }
+      (map-get? referrer-stats { vault-id: vault-id, referrer: referrer })))
+  )
+    (asserts! (get is-enabled program) ERR-REFERRAL-DISABLED)
+    (asserts! (get is-active vault) ERR-VAULT-LOCKED)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (not (is-eq tx-sender referrer)) ERR-REFERRAL-SELF)
+    (asserts! (is-none (map-get? referrals { vault-id: vault-id, referred-user: tx-sender })) ERR-ALREADY-REFERRED)
+    (asserts! (>= (get total-balance vault) reward-amount) ERR-INSUFFICIENT-BALANCE)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set vaults
+      { vault-id: vault-id }
+      (merge vault { total-balance: (+ (get total-balance vault) amount) })
+    )
+    
+    (map-set vault-deposits
+      { vault-id: vault-id, depositor: tx-sender }
+      {
+        amount: (+ amount 
+          (default-to u0 
+            (get amount 
+              (map-get? vault-deposits { vault-id: vault-id, depositor: tx-sender })))),
+        block-height: stacks-block-height
+      }
+    )
+    
+    (map-set referrals
+      { vault-id: vault-id, referred-user: tx-sender }
+      {
+        referrer: referrer,
+        deposit-amount: amount,
+        reward-paid: reward-amount,
+        referred-at: stacks-block-height
+      }
+    )
+    
+    (map-set referrer-stats
+      { vault-id: vault-id, referrer: referrer }
+      {
+        total-referred: (+ (get total-referred existing-referrer-stats) u1),
+        total-rewards: (+ (get total-rewards existing-referrer-stats) reward-amount)
+      }
+    )
+    
+    (map-set referral-programs
+      { vault-id: vault-id }
+      (merge program {
+        total-referrals: (+ (get total-referrals program) u1),
+        total-rewards-paid: (+ (get total-rewards-paid program) reward-amount)
+      })
+    )
+    
+    (map-set vaults
+      { vault-id: vault-id }
+      (merge vault { total-balance: (- (+ (get total-balance vault) amount) reward-amount) })
+    )
+    
+    (try! (as-contract (stx-transfer? reward-amount tx-sender referrer)))
+    
+    (ok { deposit: amount, referral-reward: reward-amount })
+  )
+)
+
+(define-read-only (get-referral-program (vault-id uint))
+  (map-get? referral-programs { vault-id: vault-id })
+)
+
+(define-read-only (get-referral-info (vault-id uint) (referred-user principal))
+  (map-get? referrals { vault-id: vault-id, referred-user: referred-user })
+)
+
+(define-read-only (get-referrer-stats (vault-id uint) (referrer principal))
+  (map-get? referrer-stats { vault-id: vault-id, referrer: referrer })
 )
